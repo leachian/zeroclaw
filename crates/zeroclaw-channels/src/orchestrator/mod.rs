@@ -871,6 +871,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}} — clicking opens the form and the typed field values are appended to that button's prompt when submitted. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "whatsapp-web" => Some(
+            "When responding on WhatsApp Web:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>] where name is optional (e.g. [LOCATION:40.7128,-74.0060,New York])\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "whatsapp" | "whatsapp-web" => Some(
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
@@ -19504,32 +19513,31 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn channel_delivery_instructions_for_whatsapp_web_match_local_marker_contract() {
-        let block = channel_delivery_instructions("whatsapp")
-            .expect("whatsapp channel must have a delivery-instructions block");
+        let block = channel_delivery_instructions("whatsapp-web")
+            .expect("whatsapp-web channel must have a delivery-instructions block");
         assert!(
             block.contains("When responding on WhatsApp Web:"),
-            "whatsapp block must identify itself"
+            "whatsapp-web block must identify itself"
+        );
+        assert!(
+            block.contains("[LOCATION:"),
+            "whatsapp-web block must include location pin instructions"
         );
         assert!(
             block.contains("[IMAGE:<path>]"),
-            "whatsapp block must describe marker syntax"
+            "whatsapp-web block must describe marker syntax"
         );
         assert!(
             block.contains("inside the configured workspace directory"),
-            "whatsapp block must describe workspace bounds"
+            "whatsapp-web block must describe workspace bounds"
         );
         assert!(
             block.contains("Absolute paths and workspace-relative paths are accepted"),
-            "whatsapp block must match the validator's local path contract"
+            "whatsapp-web block must match the validator's local path contract"
         );
         assert!(
             block.contains("Do not use http://, https://, data:, file:"),
-            "whatsapp block must say URL schemes are refused"
-        );
-        assert_eq!(
-            channel_delivery_instructions("whatsapp-web"),
-            Some(block),
-            "the compatibility alias should use the same WhatsApp Web guidance"
+            "whatsapp-web block must say URL schemes are refused"
         );
     }
 

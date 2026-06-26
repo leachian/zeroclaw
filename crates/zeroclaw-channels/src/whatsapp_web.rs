@@ -852,6 +852,20 @@ impl WhatsAppWebChannel {
         if base.document_message.is_some() {
             return "[Document]".to_string();
         }
+        if let Some(ref loc) = base.location_message {
+            if loc.is_live.unwrap_or(false) {
+                return String::new();
+            }
+            let (Some(lat), Some(lng)) = (loc.degrees_latitude, loc.degrees_longitude) else {
+                return String::new();
+            };
+            let name = loc.name.as_deref().unwrap_or("");
+            return if name.is_empty() {
+                format!("[Location: {lat:.6}, {lng:.6}]")
+            } else {
+                format!("[Location: {lat:.6}, {lng:.6} — {name}]")
+            };
+        }
 
         String::new()
     }
@@ -959,6 +973,26 @@ impl WhatsAppWebChannel {
         marker: &WhatsAppMediaMarker,
         path: &Path,
     ) -> Result<()> {
+        // ── Location: no upload needed, send native LocationMessage ──
+        if matches!(marker.kind, WhatsAppMediaKind::Location) {
+            let (Some(lat), Some(lng)) = (marker.location_lat, marker.location_lng) else {
+                anyhow::bail!("Location marker missing lat/lng");
+            };
+            let outgoing = waproto::whatsapp::Message {
+                location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: Some(lat),
+                    degrees_longitude: Some(lng),
+                    name: marker.location_name.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            Box::pin(client.send_message(to.clone(), outgoing))
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("WhatsApp location send failed: {e}")))?;
+            return Ok(());
+        }
+
         let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("read WhatsApp marker target {}", path.display()))?;
@@ -1045,6 +1079,10 @@ impl WhatsAppWebChannel {
                     })),
                     ..Default::default()
                 }
+            }
+            WhatsAppMediaKind::Location => {
+                // Handled before the upload path. Unreachable here.
+                unreachable!("Location handled before media upload");
             }
         };
 
@@ -1233,6 +1271,7 @@ enum WhatsAppMediaKind {
     Video,
     Audio,
     Voice,
+    Location,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -1244,6 +1283,7 @@ impl WhatsAppMediaKind {
             "VIDEO" => Some(Self::Video),
             "AUDIO" => Some(Self::Audio),
             "VOICE" => Some(Self::Voice),
+            "LOCATION" => Some(Self::Location),
             _ => None,
         }
     }
@@ -1254,6 +1294,9 @@ impl WhatsAppMediaKind {
             Self::Document => wacore::download::MediaType::Document,
             Self::Video => wacore::download::MediaType::Video,
             Self::Audio | Self::Voice => wacore::download::MediaType::Audio,
+            Self::Location => {
+                unreachable!("Location has no media type; handled before upload")
+            }
         }
     }
 
@@ -1298,17 +1341,39 @@ impl WhatsAppMediaKind {
 }
 
 #[cfg(feature = "whatsapp-web")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct WhatsAppMediaMarker {
     kind: WhatsAppMediaKind,
     target: String,
+    location_lat: Option<f64>,
+    location_lng: Option<f64>,
+    location_name: Option<String>,
 }
 
 #[cfg(feature = "whatsapp-web")]
 impl WhatsAppMediaMarker {
     fn from_shared_marker(kind: String, target: String) -> Option<Self> {
         let kind = WhatsAppMediaKind::from_marker(&kind)?;
-        Some(Self { kind, target })
+        let (location_lat, location_lng, location_name) = if matches!(
+            kind,
+            WhatsAppMediaKind::Location
+        ) {
+            let mut parts = target.splitn(3, ',');
+            let (Some(lat), Some(lng)) = (
+                parts.next()?.trim().parse::<f64>().ok(),
+                parts.next()?.trim().parse::<f64>().ok(),
+            ) else {
+                return None;
+            };
+            let name = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            (Some(lat), Some(lng), name)
+        } else {
+            (None, None, None)
+        };
+        Some(Self { kind, target, location_lat, location_lng, location_name })
     }
 }
 
@@ -1617,6 +1682,36 @@ impl Channel for WhatsAppWebChannel {
         let mut delivered_markers = 0usize;
         let mut failed_marker_count = 0usize;
         for marker in &markers {
+            // Location markers carry inline data (lat,lng), not a file path.
+            if matches!(marker.kind, WhatsAppMediaKind::Location) {
+                match Self::send_media_marker(
+                    &client,
+                    &to,
+                    marker,
+                    &PathBuf::from(&marker.target),
+                )
+                .await
+                {
+                    Ok(()) => delivered_markers += 1,
+                    Err(err) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "kind": format!("{:?}", marker.kind),
+                                "error": err.to_string(),
+                            })),
+                            "whatsapp-web: media marker delivery failed",
+                        );
+                        failed_marker_count += 1;
+                    }
+                }
+                continue;
+            }
             let target = match validate_whatsapp_marker_target(
                 &marker.target,
                 self.workspace_dir.as_deref(),
@@ -3371,6 +3466,59 @@ mod tests {
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_parses_static_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                name: Some("NYC".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Location: 40.712800, -74.006000 — NYC]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_live_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                is_live: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_missing_coordinates() {
+        let mk = |lat: Option<f64>, lng: Option<f64>| waproto::whatsapp::Message {
+            location_message: Some(Box::new(
+                waproto::whatsapp::message::LocationMessage {
+                    degrees_latitude: lat,
+                    degrees_longitude: lng,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(WhatsAppWebChannel::media_fallback_content(String::new(), &mk(Some(40.0), None)), "");
+        assert_eq!(WhatsAppWebChannel::media_fallback_content(String::new(), &mk(None, Some(-74.0))), "");
     }
 
     #[test]

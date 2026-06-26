@@ -213,7 +213,7 @@ pub fn strip_tool_call_tags(message: &str) -> String {
 
 /// Recognized attachment marker kinds (e.g. `[IMAGE:/path]`, `[DOCUMENT:url]`).
 const ATTACHMENT_KINDS: &[&str] = &[
-    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE",
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE", "LOCATION",
 ];
 
 /// Parse `[KIND:target]` attachment markers out of a message.
