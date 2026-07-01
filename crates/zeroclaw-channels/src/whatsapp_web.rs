@@ -857,6 +857,25 @@ impl WhatsAppWebChannel {
         if base.document_message.is_some() {
             return "[Document]".to_string();
         }
+        if let Some(ref loc) = base.location_message {
+            // Live locations are silently ignored — they stream
+            // periodic updates and have no meaningful static content.
+            if loc.is_live == Some(true) {
+                return String::new();
+            }
+            let lat = match loc.degrees_latitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            let lng = match loc.degrees_longitude {
+                Some(l) => l,
+                None => return String::new(),
+            };
+            return match loc.name.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) => format!("[Location: {lat:.6}, {lng:.6} — {name}]"),
+                None => format!("[Location: {lat:.6}, {lng:.6}]"),
+            };
+        }
 
         String::new()
     }
@@ -1121,6 +1140,30 @@ impl WhatsAppWebChannel {
         Ok(())
     }
 
+    /// Send a native location pin. No file read or media upload is involved —
+    /// the coordinates and labels travel inline in a `LocationMessage`.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_location(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        loc: &WhatsAppLocation,
+    ) -> Result<()> {
+        let outgoing = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(loc.lat),
+                degrees_longitude: Some(loc.lng),
+                name: loc.name.clone(),
+                address: loc.address.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        Box::pin(client.send_message(to.clone(), outgoing))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp location send failed: {e}")))?;
+        Ok(())
+    }
+
     // ── Mention detection helpers (used when mention_only is enabled) ──
 
     /// Extract digits from a JID string (e.g. "919211916069@s.whatsapp.net" -> "919211916069").
@@ -1368,14 +1411,106 @@ impl WhatsAppMediaKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WhatsAppMediaMarker {
     kind: WhatsAppMediaKind,
+    /// Path-like target resolved against the workspace before upload.
     target: String,
 }
 
+/// A native location pin parsed from a `[LOCATION:...]` marker.
 #[cfg(feature = "whatsapp-web")]
-impl WhatsAppMediaMarker {
+#[derive(Debug, Clone, PartialEq)]
+struct WhatsAppLocation {
+    lat: f64,
+    lng: f64,
+    name: Option<String>,
+    address: Option<String>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppLocation {
+    /// Parse a `[LOCATION:...]` marker target.
+    ///
+    /// Format: `lat,lng`, `lat,lng,name`, or `lat,lng,name,address`.
+    ///
+    /// `name` is a single comma-delimited field by default, but may be
+    /// double-quoted to include commas (e.g. `"ACME, Inc."`). `address` is the
+    /// trailing field and may contain commas freely — no quoting needed.
+    /// Coordinates outside the WGS84 range are rejected so a malformed marker
+    /// is dropped rather than sending a bogus pin.
+    fn parse(target: &str) -> Option<Self> {
+        // Extract the next field.  If the trimmed input starts with `"` the
+        // field runs to the closing `"` and may contain commas; otherwise the
+        // field ends at the first `,`.  Returns `(field, rest)` — `rest` has
+        // already been trimmed and stripped of the separating comma.
+        fn next_field(s: &str) -> (&str, &str) {
+            let s = s.trim();
+            if let Some(inner) = s.strip_prefix('"') {
+                if let Some(end) = inner.find('"') {
+                    // Quoted field: grab everything up to the closing quote.
+                    let field = &inner[..end];
+                    let rest = inner[end + 1..].trim();
+                    let rest = match rest.strip_prefix(',') {
+                        Some(s) => s.trim(),
+                        None => "",
+                    };
+                    return (field, rest);
+                }
+                // Unclosed quote — treat the rest as one field.
+                return (inner, "");
+            }
+            // Plain field: split on the first comma.
+            match s.find(',') {
+                Some(pos) => (s[..pos].trim(), s[pos + 1..].trim()),
+                None => (s, ""),
+            }
+        }
+
+        let (lat_str, rest) = next_field(target);
+        let lat: f64 = lat_str.parse().ok()?;
+        let (lng_str, rest) = next_field(rest);
+        let lng: f64 = lng_str.parse().ok()?;
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+            return None;
+        }
+
+        let (name_raw, rest) = next_field(rest);
+        let name = (!name_raw.is_empty()).then(|| name_raw.to_string());
+
+        let address = (!rest.is_empty()).then(|| rest.to_string());
+
+        Some(Self {
+            lat,
+            lng,
+            name,
+            address,
+        })
+    }
+}
+
+/// An outbound marker: either a file-based media attachment (resolved against
+/// the workspace and uploaded) or an inline location pin (no file, no upload).
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq)]
+enum WhatsAppMarker {
+    Media(WhatsAppMediaMarker),
+    Location(WhatsAppLocation),
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMarker {
     fn from_shared_marker(kind: String, target: String) -> Option<Self> {
+        if kind.eq_ignore_ascii_case("LOCATION") {
+            return WhatsAppLocation::parse(&target).map(Self::Location);
+        }
         let kind = WhatsAppMediaKind::from_marker(&kind)?;
-        Some(Self { kind, target })
+        Some(Self::Media(WhatsAppMediaMarker { kind, target }))
+    }
+
+    /// Short label for structured logs.
+    fn kind_label(&self) -> String {
+        match self {
+            Self::Media(m) => format!("{:?}", m.kind),
+            Self::Location(_) => "Location".to_string(),
+        }
     }
 }
 
@@ -1585,7 +1720,7 @@ impl Channel for WhatsAppWebChannel {
         };
         let markers = raw_markers
             .into_iter()
-            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
         // Voice chat mode: send text normally AND queue a voice note of the
@@ -1684,33 +1819,44 @@ impl Channel for WhatsAppWebChannel {
         let mut delivered_markers = 0usize;
         let mut failed_marker_count = 0usize;
         for marker in &markers {
-            let target = match validate_whatsapp_marker_target(
-                &marker.target,
-                self.workspace_dir.as_deref(),
-            ) {
-                Ok(path) => path,
-                Err(err) => {
-                    let kind = err.kind();
-                    let reason = match kind {
-                        WhatsAppMarkerFailure::Refused => "trust boundary",
-                        WhatsAppMarkerFailure::Failed => "not found",
+            // Location markers carry inline data (lat,lng,...) and skip the
+            // workspace file validator; media markers must resolve to a real
+            // file inside the workspace before upload.
+            let result = match marker {
+                WhatsAppMarker::Location(loc) => Self::send_location(&client, &to, loc).await,
+                WhatsAppMarker::Media(media) => {
+                    let target = match validate_whatsapp_marker_target(
+                        &media.target,
+                        self.workspace_dir.as_deref(),
+                    ) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let reason = match err.kind() {
+                                WhatsAppMarkerFailure::Refused => "trust boundary",
+                                WhatsAppMarkerFailure::Failed => "not found",
+                            };
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "kind": format!("{:?}", media.kind),
+                                    "reason": reason,
+                                    "error": err.to_string(),
+                                })),
+                                "whatsapp-web: dropping unresolved outbound attachment marker"
+                            );
+                            failed_marker_count += 1;
+                            continue;
+                        }
                     };
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "kind": format!("{:?}", marker.kind),
-                                "reason": reason,
-                                "error": err.to_string(),
-                            })),
-                        "whatsapp-web: dropping unresolved outbound attachment marker"
-                    );
-                    failed_marker_count += 1;
-                    continue;
+                    Self::send_media_marker(&client, &to, media, &target).await
                 }
             };
-            match Self::send_media_marker(&client, &to, marker, &target).await {
+            match result {
                 Ok(()) => delivered_markers += 1,
                 Err(err) => {
                     ::zeroclaw_log::record!(
@@ -1718,10 +1864,10 @@ impl Channel for WhatsAppWebChannel {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
-                                "kind": format!("{:?}", marker.kind),
+                                "kind": marker.kind_label(),
                                 "error": err.to_string(),
                             })),
-                        "whatsapp-web: media marker delivery failed"
+                        "whatsapp-web: marker delivery failed"
                     );
                     failed_marker_count += 1;
                 }
@@ -2589,17 +2735,110 @@ mod tests {
         );
         let markers = raw
             .into_iter()
-            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
         assert_eq!(cleaned, "send");
         assert_eq!(
-            markers.iter().map(|marker| marker.kind).collect::<Vec<_>>(),
+            markers
+                .iter()
+                .map(|marker| match marker {
+                    WhatsAppMarker::Media(m) => m.kind,
+                    WhatsAppMarker::Location(_) => panic!("expected media markers"),
+                })
+                .collect::<Vec<_>>(),
             vec![
                 WhatsAppMediaKind::Image,
                 WhatsAppMediaKind::Document,
                 WhatsAppMediaKind::Voice
             ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn location_marker_parses_coordinates_name_and_address() {
+        // Bare coordinates.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: None,
+                address: None,
+            })
+        );
+        // Coordinates + name, with surrounding whitespace trimmed.
+        assert_eq!(
+            WhatsAppLocation::parse(" 40.7128 , -74.0060 , Statue of Liberty "),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("Statue of Liberty".to_string()),
+                address: None,
+            })
+        );
+        // The address is the trailing field and may contain commas.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,Liberty Island,New York, NY 10004"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("Liberty Island".to_string()),
+                address: Some("New York, NY 10004".to_string()),
+            })
+        );
+        // Double-quoted name may contain commas.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\",New York, NY 10004"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("ACME, Inc.".to_string()),
+                address: Some("New York, NY 10004".to_string()),
+            })
+        );
+        // Quoted name without trailing address.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\""),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("ACME, Inc.".to_string()),
+                address: None,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn location_marker_rejects_out_of_range_coordinates() {
+        assert_eq!(WhatsAppLocation::parse("91.0,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("-91.0,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("0.0,181.0"), None);
+        assert_eq!(WhatsAppLocation::parse("0.0,-181.0"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn location_marker_rejects_malformed_input() {
+        assert_eq!(WhatsAppLocation::parse("not-a-number,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("40.7128"), None);
+        assert_eq!(WhatsAppLocation::parse(""), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn from_shared_marker_routes_location_kind() {
+        let marker = WhatsAppMarker::from_shared_marker(
+            "LOCATION".to_string(),
+            "40.7128,-74.0060".to_string(),
+        );
+        assert!(matches!(marker, Some(WhatsAppMarker::Location(_))));
+        // Out-of-range coordinates drop the whole marker rather than sending a bogus pin.
+        assert_eq!(
+            WhatsAppMarker::from_shared_marker("LOCATION".to_string(), "999,999".to_string()),
+            None
         );
     }
 
@@ -3512,6 +3751,73 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content_leaves_non_media_messages_empty() {
         let msg = waproto::whatsapp::Message::default();
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_parses_static_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                name: Some("NYC".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Location: 40.712800, -74.006000 — NYC]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_live_location() {
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: Some(-74.0060),
+                is_live: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_skips_missing_coordinates() {
+        // Missing longitude — should silently drop, not fabricate 0,0
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: Some(40.7128),
+                degrees_longitude: None,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+        // Missing latitude
+        let msg = waproto::whatsapp::Message {
+            location_message: Some(Box::new(waproto::whatsapp::message::LocationMessage {
+                degrees_latitude: None,
+                degrees_longitude: Some(-74.0060),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
         assert_eq!(
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""
